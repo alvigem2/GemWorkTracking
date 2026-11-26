@@ -1,0 +1,174 @@
+name: Respaldo PostgreSQL
+
+on:
+  workflow_dispatch:
+  # Activar solo después de verificar un respaldo manual.
+  # schedule:
+  #   - cron: '0 6 * * *'
+
+permissions: {}
+
+concurrency:
+  group: gemwork-postgres-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    if: ${{ vars.BACKUP_ENABLED == 'true' && github.ref_name == github.event.repository.default_branch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: postgres-backup
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Comprobar destino privado
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.BACKUP_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.BACKUP_AWS_REGION }}
+          BUCKET: ${{ vars.BACKUP_S3_BUCKET }}
+          OWNER: ${{ vars.BACKUP_S3_OWNER }}
+        run: |
+          set -euo pipefail
+          : "${AWS_ACCESS_KEY_ID:?Falta el secreto de acceso S3}"
+          : "${AWS_SECRET_ACCESS_KEY:?Falta el secreto de acceso S3}"
+          : "${AWS_REGION:?Falta la región S3}"
+          : "${BUCKET:?Falta el bucket S3}"
+          [[ "$OWNER" =~ ^[0-9]{12}$ ]] || { echo 'Falta el ID de cuenta propietaria S3.'; exit 1; }
+          if ! private=$(aws s3api get-public-access-block --bucket "$BUCKET" \
+            --expected-bucket-owner "$OWNER" --region "$AWS_REGION" \
+            --query 'PublicAccessBlockConfiguration.[BlockPublicAcls,IgnorePublicAcls,BlockPublicPolicy,RestrictPublicBuckets]' \
+            --output text 2>/dev/null); then
+            echo 'No se pudo verificar el destino S3 privado.'
+            exit 1
+          fi
+          read -r block_acl ignore_acl block_policy restrict_bucket <<< "$private"
+          if [[ "$block_acl $ignore_acl $block_policy $restrict_bucket" != 'True True True True' ]]; then
+            echo 'El bucket debe tener activadas las cuatro opciones de bloqueo público.'
+            exit 1
+          fi
+
+      - name: Generar y verificar el archivo
+        id: archive
+        env:
+          PGHOST: ${{ vars.SUPABASE_DB_HOST }}
+          PGDATABASE: ${{ vars.SUPABASE_DB_NAME }}
+          PGUSER: ${{ vars.SUPABASE_DB_USER }}
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_CA: ${{ vars.SUPABASE_DB_CA_PEM }}
+          PG_MAJOR: ${{ vars.BACKUP_PG_MAJOR }}
+          PGPORT: '5432'
+          PGSSLMODE: verify-full
+          PGSSLROOTCERT: /backup/supabase-ca.pem
+          PGCONNECT_TIMEOUT: '15'
+          TZ: America/La_Paz
+        run: |
+          set -euo pipefail
+          umask 077
+          : "${PGDATABASE:?Falta el nombre de la base de datos}"
+          : "${PGUSER:?Falta el usuario PostgreSQL}"
+          : "${PGPASSWORD:?Falta el secreto PostgreSQL}"
+          : "${SUPABASE_CA:?Falta el certificado CA de Supabase}"
+          [[ "$PGHOST" =~ ^db\.[a-z0-9]+\.supabase\.co$ || "$PGHOST" =~ ^[a-z0-9.-]+\.pooler\.supabase\.com$ ]] ||
+            { echo 'Usa el host directo o el pooler de sesión de Supabase.'; exit 1; }
+          [[ "$PG_MAJOR" =~ ^[1-9][0-9]$ ]] ||
+            { echo 'Configura la versión mayor de PostgreSQL, por ejemplo 17.'; exit 1; }
+
+          work=$(mktemp -d "$RUNNER_TEMP/gemwork-backup.XXXXXXXX")
+          printf '%s\n' "$SUPABASE_CA" > "$work/supabase-ca.pem"
+          image="postgres:${PG_MAJOR}-bookworm"
+          docker pull "$image" > /dev/null
+          client_version=$(docker run --rm --network none "$image" pg_dump --version)
+          client_major=$(printf '%s\n' "$client_version" | sed -En 's/^pg_dump \(PostgreSQL\) ([0-9]+).*/\1/p')
+          [[ "$client_major" == "$PG_MAJOR" ]] ||
+            { echo 'La versión del binario pg_dump no coincide con BACKUP_PG_MAJOR.'; exit 1; }
+
+          pg_tool() {
+            docker run --rm --network host --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=$work,target=/backup" \
+            --env PGHOST --env PGPORT --env PGDATABASE --env PGUSER --env PGPASSWORD \
+            --env PGSSLMODE --env PGSSLROOTCERT --env PGCONNECT_TIMEOUT \
+            "$image" "$@"
+          }
+
+          if ! server_version=$(pg_tool psql -XAt --no-password -v ON_ERROR_STOP=1 \
+            -c 'SHOW server_version_num' 2>"$work/pg-error.log"); then
+            echo 'No se pudo comprobar la versión del servidor. Revisa conexión, TLS y credenciales.'
+            exit 1
+          fi
+          if [[ ! "$server_version" =~ ^[0-9]+$ ]] || (( server_version / 10000 != PG_MAJOR )); then
+            echo 'La versión mayor del servidor no coincide con BACKUP_PG_MAJOR.'
+            exit 1
+          fi
+          echo "Versión mayor compatible: $PG_MAJOR"
+
+          stamp=$(date '+%Y%m%dT%H%M%S%z')
+          name="gemwork-public-${stamp}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.dump"
+          if ! pg_tool pg_dump --no-password --format=custom --schema=public \
+            --no-publications --no-subscriptions --lock-wait-timeout=30s \
+            --file="/backup/$name" 2>"$work/pg-error.log"; then
+            echo 'pg_dump falló. Revisa permisos de lectura y posibles bloqueos.'
+            exit 1
+          fi
+
+          # Verificación local sin conexión a una base de datos.
+          if ! test -s "$work/$name" ||
+             ! docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=$work,target=/backup,readonly" \
+            "$image" pg_restore --list "/backup/$name" > "$work/toc.txt" ||
+             ! grep -q ' TABLE DATA public ' "$work/toc.txt" ||
+             ! docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=$work,target=/backup,readonly" \
+            "$image" pg_restore --file=/dev/null "/backup/$name"; then
+            echo 'El archivo no pasó la verificación de contenido.'
+            exit 1
+          fi
+          printf 'file=%s\nname=%s\n' "$work/$name" "$name" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar y comprobar el respaldo en S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.BACKUP_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.BACKUP_AWS_REGION }}
+          BUCKET: ${{ vars.BACKUP_S3_BUCKET }}
+          OWNER: ${{ vars.BACKUP_S3_OWNER }}
+          ARCHIVE: ${{ steps.archive.outputs.file }}
+          NAME: ${{ steps.archive.outputs.name }}
+        run: |
+          set -euo pipefail
+          size=$(stat -c '%s' "$ARCHIVE")
+          if (( size > 5000000000 )); then
+            echo 'El archivo supera el límite de carga individual del workflow.'
+            exit 1
+          fi
+          digest=$(openssl dgst -sha256 -binary "$ARCHIVE" | openssl base64 -A)
+          key="gemwork/postgres/$NAME"
+          if ! aws s3api put-object --bucket "$BUCKET" --key "$key" --body "$ARCHIVE" \
+            --expected-bucket-owner "$OWNER" --region "$AWS_REGION" \
+            --server-side-encryption AES256 --if-none-match '*' \
+            --checksum-sha256 "$digest" >/dev/null 2>&1; then
+            echo 'No se confirmó la carga S3. Comprueba el destino antes de reintentar.'
+            exit 1
+          fi
+
+          if ! remote=$(aws s3api head-object --bucket "$BUCKET" --key "$key" \
+            --expected-bucket-owner "$OWNER" --region "$AWS_REGION" --checksum-mode ENABLED \
+            --query '[ContentLength,ChecksumSHA256,ServerSideEncryption]' --output text 2>/dev/null); then
+            echo 'La carga respondió correctamente, pero no se pudo verificar el objeto.'
+            exit 1
+          fi
+          read -r remote_size remote_digest encryption <<< "$remote"
+          [[ "$remote_size" == "$size" && "$remote_digest" == "$digest" && "$encryption" == 'AES256' ]] ||
+            { echo 'La verificación remota de tamaño, SHA-256 o cifrado falló.'; exit 1; }
+
+          printf 'Archivo verificado: %s (%s bytes).\n' "$NAME" "$size" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Registrar resultado
+        if: ${{ always() }}
+        env:
+          RESULTADO: ${{ job.status }}
+          TZ: America/La_Paz
+        run: |
+          printf '\nResultado: %s · %s\n' "$RESULTADO" "$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$GITHUB_STEP_SUMMARY"

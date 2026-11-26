@@ -1,0 +1,21 @@
+.developer-metrics { grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); }
+.developer-note { margin-bottom: 16px; }
+.developer-projects { margin: 0; padding: 16px 40px; overflow-wrap: anywhere; }
+
+.developer-task-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 24px;
+  margin: 0;
+  padding: 20px;
+}
+
+.developer-task-details dt { font-weight: 600; }
+.developer-task-details dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.developer-task-details .admin-field-wide dd { white-space: pre-wrap; }
+
+.developer-readonly { padding: 0 20px 16px; }
+
+@media (max-width: 480px) {
+  .developer-task-details { grid-template-columns: minmax(0, 1fr); }
+}
